@@ -1,0 +1,210 @@
+--- a/train.py
++++ b/train.py
+@@ -558,6 +558,82 @@
+     return resolved, manifest, _sha256(resolved)
+ 
+ 
++def _rbe_protocol_contract(protocol_name):
++    contracts = {
++        "ch4_rbe_boundary_core_training_protocol_v1": {
++            "family": "legacy",
++            "ablation_id": None,
++            "search_actors_frozen": False,
++            "executor_only_actor_training": False,
++            "sampling_ratios": {
++                "boundary_core": 0.50,
++                "uniform_coverage": 0.30,
++                "composite_high_risk_aux": 0.10,
++                "nominal_anchor": 0.10,
++            },
++            "optimization_scope": None,
++        },
++        "ch4_rbe_boundary_core_training_protocol_perf_v1": {
++            "family": "perf",
++            "ablation_id": None,
++            "search_actors_frozen": True,
++            "executor_only_actor_training": True,
++            "sampling_ratios": {
++                "boundary_core": 0.40,
++                "uniform_coverage": 0.35,
++                "composite_high_risk_aux": 0.05,
++                "nominal_anchor": 0.20,
++            },
++            "optimization_scope": "current_method_performance_stabilization_only",
++        },
++        "ch4_rbe_perf_ablation_no_boundary_protocol_v1": {
++            "family": "ablation",
++            "ablation_id": "no_boundary_core",
++            "search_actors_frozen": True,
++            "executor_only_actor_training": True,
++            "sampling_ratios": {
++                "boundary_core": 0.00,
++                "uniform_coverage": 0.75,
++                "composite_high_risk_aux": 0.05,
++                "nominal_anchor": 0.20,
++            },
++            "optimization_scope": "mechanism_ablation_only",
++        },
++        "ch4_rbe_perf_ablation_all_actors_protocol_v1": {
++            "family": "ablation",
++            "ablation_id": "all_actors_trainable",
++            "search_actors_frozen": False,
++            "executor_only_actor_training": False,
++            "sampling_ratios": {
++                "boundary_core": 0.40,
++                "uniform_coverage": 0.35,
++                "composite_high_risk_aux": 0.05,
++                "nominal_anchor": 0.20,
++            },
++            "optimization_scope": "mechanism_ablation_only",
++        },
++        "ch4_rbe_perf_ablation_no_nominal_protocol_v1": {
++            "family": "ablation",
++            "ablation_id": "no_nominal_anchor",
++            "search_actors_frozen": True,
++            "executor_only_actor_training": True,
++            "sampling_ratios": {
++                "boundary_core": 0.40,
++                "uniform_coverage": 0.55,
++                "composite_high_risk_aux": 0.05,
++                "nominal_anchor": 0.00,
++            },
++            "optimization_scope": "mechanism_ablation_only",
++        },
++    }
++    contract = contracts.get(str(protocol_name))
++    if contract is None:
++        raise RuntimeError(
++            f"unsupported RBE protocol manifest protocol_name: {protocol_name!r}"
++        )
++    return contract
++
++
+ def _audit_rbe_protocol_lock(
+     *,
+     mode,
+@@ -582,17 +658,19 @@
+ ):
+     manifest_path, manifest, manifest_sha = _load_rbe_protocol_manifest(os.environ.get("RBE_TRAINING_PROTOCOL_MANIFEST"))
+     protocol_name = manifest.get("protocol_name")
+-    legacy_protocol = protocol_name == "ch4_rbe_boundary_core_training_protocol_v1"
+-    perf_protocol = protocol_name == "ch4_rbe_boundary_core_training_protocol_perf_v1"
+-    if not (legacy_protocol or perf_protocol):
+-        raise RuntimeError(f"unsupported RBE protocol manifest protocol_name: {protocol_name!r}")
++    protocol_contract = _rbe_protocol_contract(protocol_name)
++    legacy_protocol = protocol_contract["family"] == "legacy"
++    perf_protocol = protocol_contract["family"] == "perf"
++    perf_family_protocol = protocol_contract["family"] in {"perf", "ablation"}
++    expected_freeze_search_actors = bool(protocol_contract["search_actors_frozen"])
++    expected_executor_only_actor = bool(protocol_contract["executor_only_actor_training"])
+     required_env = {
+         "CH4_MODE": "ch4_rbe_full",
+         "RBE_SAMPLER_ENABLE": "1",
+         "REB_ENABLE": "0",
+         "RSCU_ENABLE": "0",
+-        "FREEZE_SEARCH_ACTORS": "1" if perf_protocol else "0",
+-        "RBE_EXECUTOR_ONLY_ACTOR": "1" if perf_protocol else "0",
++        "FREEZE_SEARCH_ACTORS": "1" if expected_freeze_search_actors else "0",
++        "RBE_EXECUTOR_ONLY_ACTOR": "1" if expected_executor_only_actor else "0",
+         "COLLECT_BOUNDARY_DATASET": "1",
+         "REWARD_PROFILE": "residual_point_v3",
+         "RESIDUAL_ACTION_MODE": "hybrid_v4",
+@@ -613,16 +691,16 @@
+         raise RuntimeError("RBE protocol lock requires REB_ENABLE=0")
+     if rscu_enable:
+         raise RuntimeError("RBE protocol lock requires RSCU_ENABLE=0")
+-    if freeze_search_actors is not perf_protocol:
+-        expected = 1 if perf_protocol else 0
++    if bool(freeze_search_actors) != expected_freeze_search_actors:
++        expected = 1 if expected_freeze_search_actors else 0
+         raise RuntimeError(f"RBE protocol lock requires FREEZE_SEARCH_ACTORS={expected}")
+-    if rbe_executor_only_actor is not perf_protocol:
+-        expected = 1 if perf_protocol else 0
++    if bool(rbe_executor_only_actor) != expected_executor_only_actor:
++        expected = 1 if expected_executor_only_actor else 0
+         raise RuntimeError(f"RBE protocol lock requires RBE_EXECUTOR_ONLY_ACTOR={expected}")
+ 
+     expected_resume_path = (
+         manifest.get("uniform_warm_start_model_path")
+-        if perf_protocol
++        if perf_family_protocol
+         else "models_ch4_rbe/ch4_uniform_dr_selected_full9d_v2/selected_by_uniform_dr_validation.pt"
+     )
+     expected_resume = _resolve_project_path(expected_resume_path)
+@@ -659,9 +737,9 @@
+         "online_reb_training": False,
+         "frozen_found_aware_reb_used_only_for_candidate_derivation": True,
+         "rscu_enabled": False,
+-        "search_actors_frozen": perf_protocol,
+-        "executor_only_actor_training": perf_protocol,
+-        "all_policy_actors_trainable": not perf_protocol,
++        "search_actors_frozen": expected_freeze_search_actors,
++        "executor_only_actor_training": expected_executor_only_actor,
++        "all_policy_actors_trainable": not expected_freeze_search_actors,
+         "ratios_locked": True,
+         "jitter_locked": True,
+     }
+@@ -687,21 +765,7 @@
+         raise RuntimeError("RBE protocol lock controller environment override mismatch")
+     _validate_method_claims(manifest.get("method_statement_zh"), manifest.get("method_statement_en"))
+ 
+-    expected_ratios = (
+-        {
+-            "boundary_core": 0.40,
+-            "uniform_coverage": 0.35,
+-            "composite_high_risk_aux": 0.05,
+-            "nominal_anchor": 0.20,
+-        }
+-        if perf_protocol
+-        else {
+-            "boundary_core": 0.50,
+-            "uniform_coverage": 0.30,
+-            "composite_high_risk_aux": 0.10,
+-            "nominal_anchor": 0.10,
+-        }
+-    )
++    expected_ratios = dict(protocol_contract["sampling_ratios"])
+     actual_ratios = {
+         "boundary_core": rbe_boundary_ratio,
+         "uniform_coverage": rbe_uniform_ratio,
+@@ -718,17 +782,25 @@
+         raise RuntimeError("RBE protocol lock requires RBE_JITTER_STD=0.02 and RBE_JITTER_PROB=0.50")
+     if not _float_equal(manifest.get("jitter_std"), 0.02) or not _float_equal(manifest.get("jitter_prob"), 0.50):
+         raise RuntimeError("RBE protocol manifest jitter mismatch")
+-    if perf_protocol:
+-        if manifest.get("optimization_scope") != "current_method_performance_stabilization_only":
+-            raise RuntimeError("RBE perf protocol optimization_scope mismatch")
++    if perf_family_protocol:
++        expected_scope = protocol_contract["optimization_scope"]
++        if manifest.get("optimization_scope") != expected_scope:
++            raise RuntimeError("RBE perf-family protocol optimization_scope mismatch")
++        expected_ablation_id = protocol_contract.get("ablation_id")
++        actual_ablation_id = manifest.get("ablation_id")
++        if expected_ablation_id is None:
++            if actual_ablation_id not in (None, ""):
++                raise RuntimeError("base Perf-RBE protocol must not declare an ablation_id")
++        elif actual_ablation_id != expected_ablation_id:
++            raise RuntimeError("RBE ablation protocol ablation_id mismatch")
+         if manifest.get("new_algorithmic_module_added") is not False:
+-            raise RuntimeError("RBE perf protocol must not add an algorithmic module")
++            raise RuntimeError("RBE perf-family protocol must not add an algorithmic module")
+         if manifest.get("optimizer_state_reset") is not True or not rbe_reset_optimizer_state:
+-            raise RuntimeError("RBE perf protocol requires RBE_RESET_OPTIMIZER_STATE=1")
++            raise RuntimeError("RBE perf-family protocol requires RBE_RESET_OPTIMIZER_STATE=1")
+         if not _float_equal(manifest.get("actor_lr"), 1e-4) or not _float_equal(rbe_actor_lr, 1e-4):
+-            raise RuntimeError("RBE perf protocol requires RBE_ACTOR_LR=1e-4")
++            raise RuntimeError("RBE perf-family protocol requires RBE_ACTOR_LR=1e-4")
+         if not _float_equal(manifest.get("critic_lr"), 3e-4) or not _float_equal(rbe_critic_lr, 3e-4):
+-            raise RuntimeError("RBE perf protocol requires RBE_CRITIC_LR=3e-4")
++            raise RuntimeError("RBE perf-family protocol requires RBE_CRITIC_LR=3e-4")
+     elif rbe_reset_optimizer_state or rbe_actor_lr is not None or rbe_critic_lr is not None:
+         raise RuntimeError("legacy RBE protocol v1 forbids perf optimizer overrides")
+ 
+@@ -772,6 +844,7 @@
+         "rbe_training_protocol_manifest": manifest_path,
+         "rbe_training_protocol_manifest_sha256": manifest_sha,
+         "rbe_protocol_name": manifest.get("protocol_name"),
++        "rbe_ablation_id": protocol_contract.get("ablation_id"),
+         "rbe_protocol_object_sha256": protocol_object_sha,
+         "rbe_method_name_zh": manifest.get("method_name_zh"),
+         "rbe_method_name_en": manifest.get("method_name_en"),
